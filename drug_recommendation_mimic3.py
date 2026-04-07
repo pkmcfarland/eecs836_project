@@ -26,7 +26,7 @@ if __name__ == "__main__":
     base_dataset = MIMIC3Dataset(
         root=config["MIMIC3"]["data_path"],
         tables=["DIAGNOSES_ICD", "PROCEDURES_ICD", "PRESCRIPTIONS"],
-        cache_dir=config["CACH_DIR"],
+        cache_dir=config["CACHE_DIR"],
         dev=True,
     )
     base_dataset.stats()

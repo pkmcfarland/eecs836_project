@@ -25,7 +25,7 @@ All three scripts read their settings from a `config.json` file in the same dire
     "MIMIC3": {
         "data_path": "/path/to/mimic-iii-clinical-database-1.4"
     },
-    "CACH_DIR": "/path/to/cache/directory"
+    "CACHE_DIR": "/path/to/cache/directory"
 }
 ```
 
