@@ -27,7 +27,7 @@ if __name__ == "__main__":
         root=config["MIMIC3"]["data_path"],
         tables=["DIAGNOSES_ICD", "PROCEDURES_ICD", "PRESCRIPTIONS"],
         cache_dir=config["CACHE_DIR"],
-        dev=True,
+        dev=True, #TODO: set to False for full dataset
     )
     base_dataset.stats()
 
@@ -50,7 +50,7 @@ if __name__ == "__main__":
 
     # STEP 3: define model
     logger.info("Initializing Transformer model")
-    model = Transformer(
+    model = Transformer(         #TODO: change to RNN for baseline
         dataset=sample_dataset,
     )
 
@@ -64,7 +64,7 @@ if __name__ == "__main__":
     trainer.train(
         train_dataloader=train_dataloader,
         val_dataloader=val_dataloader,
-        epochs=1,
+        epochs=1, #TODO: increase number (20-30?) for full training
         monitor="pr_auc_samples",
     )
 
@@ -72,3 +72,6 @@ if __name__ == "__main__":
     logger.info("Evaluating on test set")
     results = trainer.evaluate(test_dataloader)
     logger.info("Test results: %s", results)
+
+    # TODO: add RETAIN model and compare results
+    # TODO: add transformer model and compare results
