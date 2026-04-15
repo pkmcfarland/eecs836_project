@@ -59,6 +59,8 @@ if __name__ == "__main__":
     logger.info("Setting DrugRecommendationMIMIC3 task")
     task = DrugRecommendationMIMIC3()
     sample_dataset = base_dataset.set_task(task)
+    drug_vocab_size = len(sample_dataset[0]['drugs'])
+    logger.info("Drug vocabulary size (N): %d", drug_vocab_size)
 
     logger.info("Splitting dataset by patient [0.8, 0.1, 0.1]")
     train_dataset, val_dataset, test_dataset = split_by_patient(
