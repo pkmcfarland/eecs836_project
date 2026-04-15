@@ -1,0 +1,6 @@
+Project.code-workspace
+.claude/settings.local.json
+.cache/
+Logs/
+output/
+config.json
