@@ -41,6 +41,7 @@ Contains everything shared across the three task scripts:
 | `load_task_config(config, task_key, logger)` | function | Extracts the task block from config and returns a flat dict of pipeline parameters. |
 | `load_and_split_dataset(...)` | function | Loads `MIMIC3Dataset`, applies a task, splits by patient, and returns three dataloaders. |
 | `run_training_loop(...)` | function | Trains each model at each checkpoint and evaluates on val and test. Returns `(results, raw_preds)`. |
+| `save_results(results, task_name, log_dir, logger)` | function | Serialises the results dict to a timestamped JSON file in `LOG_DIR`. Converts numpy scalars to plain Python types before writing. |
 
 `run_training_loop` returns two values:
 - `results` — dict keyed by model name, containing `val_by_epoch` and `test` metric dicts.
@@ -117,7 +118,9 @@ python mortality_prediction_mimic3.py
 python readmission_prediction_mimic3.py
 ```
 
-Each script writes a timestamped log file to `LOG_DIR` (e.g., `drug_recommendation_20260416_120000.log`).
+Each script writes two timestamped output files to `LOG_DIR`:
+- A log file (e.g., `drug_recommendation_20260416_120000.log`) with progress and per-checkpoint metrics.
+- A JSON results file (e.g., `drug_recommendation_results_20260416_120000.json`) with the full results dict, including all validation snapshots and final test metrics.
 
 ## Pipeline
 
@@ -127,6 +130,7 @@ All three scripts follow the same pipeline, implemented in `eecs836_project_help
 2. **`load_task_config`** — Read the task's config block; call `set_seed`.
 3. **`load_and_split_dataset`** — Load `MIMIC3Dataset`, apply the task, split 80/10/10 by patient, return dataloaders.
 4. **`run_training_loop`** — For each model in `MODELS`, iterate over `CHECK_POINTS`: train from scratch for that many epochs, log validation metrics, then evaluate the final checkpoint on the test set.
+5. **`save_results`** — Serialise the completed results dict to a timestamped JSON file in `LOG_DIR`.
 
 ## Data Access
 
