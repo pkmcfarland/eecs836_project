@@ -1,4 +1,5 @@
 import datetime
+import json
 import logging
 from pathlib import Path
 
@@ -215,3 +216,40 @@ def run_training_loop(models, check_points, sample_dataset,
         logger.info("Test results: %s", results[model_name])
 
     return results, raw_preds
+
+
+def save_results(results, task_name, log_dir, logger):
+    """Serialise the results dict to a timestamped JSON file in log_dir.
+
+    Args:
+        results:   The results dict returned by run_training_loop (optionally
+                   augmented with additional metrics such as Precision@k).
+        task_name: Used as the filename stem, e.g. "drug_recommendation".
+        log_dir:   Directory to write the file into (will be created if absent).
+        logger:    Logger for the confirmation message.
+
+    Returns:
+        The Path of the written file.
+    """
+    now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = Path(log_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{task_name}_results_{now}.json"
+
+    # json.dump requires plain Python types; convert numpy scalars to float
+    def _to_serialisable(obj):
+        if isinstance(obj, dict):
+            return {str(k): _to_serialisable(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_to_serialisable(v) for v in obj]
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.integer):
+            return int(obj)
+        return obj
+
+    with open(out_path, "w") as f:
+        json.dump(_to_serialisable(results), f, indent=2)
+
+    logger.info("Results written to %s", out_path)
+    return out_path

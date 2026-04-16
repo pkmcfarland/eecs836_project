@@ -4,7 +4,7 @@ from pyhealth.tasks import MortalityPredictionMIMIC3
 from pyhealth.utils import set_seed
 
 from eecs836_project_helpers import (
-    setup_logging, load_task_config, load_and_split_dataset, run_training_loop,
+    setup_logging, load_task_config, load_and_split_dataset, run_training_loop, save_results,
 )
 
 if __name__ == "__main__":
@@ -39,3 +39,5 @@ if __name__ == "__main__":
         monitor="pr_auc",
         logger=logger,
     )
+
+    save_results(results, "mortality_prediction", config["LOG_DIR"], logger)

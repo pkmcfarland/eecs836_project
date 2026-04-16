@@ -5,7 +5,7 @@ from pyhealth.utils import set_seed
 
 from eecs836_project_helpers import (
     setup_logging, load_task_config, load_and_split_dataset,
-    run_training_loop, precision_at_k, recall_at_k,
+    run_training_loop, precision_at_k, recall_at_k, save_results,
 )
 
 if __name__ == "__main__":
@@ -51,3 +51,5 @@ if __name__ == "__main__":
         results[model_name]["test"]["recall@10"]    = recall_at_k(y_true, y_prob, k=10)
         results[model_name]["test"]["recall@20"]    = recall_at_k(y_true, y_prob, k=20)
         logger.info("Final test results for %s: %s", model_name, results[model_name]["test"])
+
+    save_results(results, "drug_recommendation", config["LOG_DIR"], logger)
