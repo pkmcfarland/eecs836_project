@@ -2,9 +2,19 @@
 
 Baseline training and evaluation scripts for three clinical prediction tasks on the MIMIC-III dataset, built with [PyHealth](https://pyhealth.readthedocs.io/).
 
-## Scripts
+## File overview
 
-All three scripts follow the same structure: they read settings from `config.json`, load and split the dataset once, then loop over all models and training-epoch checkpoints defined in the config, logging validation metrics at each checkpoint and test metrics at the end.
+| File | Purpose |
+|---|---|
+| [eecs836_project_helpers.py](eecs836_project_helpers.py) | Shared pipeline: `MODEL_DICT`, evaluation helpers, and the four pipeline functions used by all task scripts. |
+| [drug_recommendation_mimic3.py](drug_recommendation_mimic3.py) | Task 1 — Drug Recommendation (multi-label). |
+| [mortality_prediction_mimic3.py](mortality_prediction_mimic3.py) | Task 2 — In-Hospital Mortality (binary). |
+| [readmission_prediction_mimic3.py](readmission_prediction_mimic3.py) | Task 3 — Hospital Readmission (binary). |
+| [config.json](config.json) | All paths and hyperparameters. Edit this file; do not edit the scripts. |
+
+## Task scripts
+
+Each task script is responsible only for what is unique to that task: instantiating the correct PyHealth task object, choosing the right metrics, and any task-specific post-processing. Everything else is delegated to the helpers library.
 
 ### `drug_recommendation_mimic3.py` — Task 1: Drug Recommendation (Multi-label)
 
@@ -18,20 +28,41 @@ Predicts whether a patient will die during the hospital stay. Evaluates with AUP
 
 Predicts whether a patient will be readmitted within 30 days of discharge. Evaluates with AUPRC and AUROC.
 
-## Configuration
+## Helpers library (`eecs836_project_helpers.py`)
 
-All three scripts read their settings from `config.json` in the working directory. The file has a top-level section for shared paths and one section per task:
+Contains everything shared across the three task scripts:
+
+| Symbol | Type | Description |
+|---|---|---|
+| `MODEL_DICT` | dict | Maps model name strings (`"RNN"`, `"RETAIN"`, `"Transformer"`) to their PyHealth classes. |
+| `precision_at_k(y_true, y_prob, k)` | function | Sample-averaged Precision@k for multi-label prediction. |
+| `recall_at_k(y_true, y_prob, k)` | function | Sample-averaged Recall@k for multi-label prediction. |
+| `setup_logging(task_name, config)` | function | Creates `LOG_DIR`, configures root logging to a timestamped file, returns a named logger. |
+| `load_task_config(config, task_key, logger)` | function | Extracts the task block from config and returns a flat dict of pipeline parameters. |
+| `load_and_split_dataset(...)` | function | Loads `MIMIC3Dataset`, applies a task, splits by patient, and returns three dataloaders. |
+| `run_training_loop(...)` | function | Trains each model at each checkpoint and evaluates on val and test. Returns `(results, raw_preds)`. |
+
+`run_training_loop` returns two values:
+- `results` — dict keyed by model name, containing `val_by_epoch` and `test` metric dicts.
+- `raw_preds` — dict keyed by model name, containing `(y_true, y_prob)` arrays from test-set inference. Used by the drug recommendation script to compute Precision@k and Recall@k; ignored by the binary tasks.
+
+## Configuration (`config.json`)
+
+All paths and hyperparameters live in `config.json`. The file has shared top-level keys and one section per task:
 
 ```json
 {
     "DATA_DIR": "/path/to/mimic-iii-clinical-database-1.4",
     "LOG_DIR": "/path/to/logs",
     "CACHE_DIR": "/path/to/cache",
+    "SEED": 42,
     "DRUG_RECOMMENDATION": {
         "MODELS": ["RNN", "RETAIN", "Transformer"],
         "TABLES": ["DIAGNOSES_ICD", "PROCEDURES_ICD", "PRESCRIPTIONS"],
         "DEV_MODE": false,
         "CHECK_POINTS": [20, 30, 40, 50, 75, 100],
+        "SEED": 42,
+        "BATCH_SIZE": 32,
         "SPLITS": { "TRAIN": 0.8, "VAL": 0.1, "TEST": 0.1 }
     },
     "MORTALITY_PREDICTION": {
@@ -39,6 +70,8 @@ All three scripts read their settings from `config.json` in the working director
         "TABLES": ["DIAGNOSES_ICD", "PROCEDURES_ICD", "PRESCRIPTIONS"],
         "DEV_MODE": true,
         "CHECK_POINTS": [20, 30, 40, 50, 75, 100],
+        "SEED": 42,
+        "BATCH_SIZE": 32,
         "SPLITS": { "TRAIN": 0.8, "VAL": 0.1, "TEST": 0.1 }
     },
     "READMISSION_PREDICTION": {
@@ -46,6 +79,8 @@ All three scripts read their settings from `config.json` in the working director
         "TABLES": ["DIAGNOSES_ICD", "PROCEDURES_ICD", "PRESCRIPTIONS"],
         "DEV_MODE": true,
         "CHECK_POINTS": [20, 30, 40, 50, 75, 100],
+        "SEED": 42,
+        "BATCH_SIZE": 32,
         "SPLITS": { "TRAIN": 0.8, "VAL": 0.1, "TEST": 0.1 }
     }
 }
@@ -56,8 +91,9 @@ All three scripts read their settings from `config.json` in the working director
 | Key | Description |
 |---|---|
 | `DATA_DIR` | Absolute path to the root of the MIMIC-III v1.4 dataset (the directory containing the CSV files). |
-| `LOG_DIR` | Absolute path to the directory where timestamped log files are written. |
+| `LOG_DIR` | Absolute path to the directory where timestamped log files are written. Created automatically if it does not exist. |
 | `CACHE_DIR` | Absolute path to a directory where PyHealth caches the parsed dataset. Reusing the same cache directory across scripts avoids re-parsing the raw CSVs on every run. |
+| `SEED` | Top-level seed (reserved; not currently read by the task scripts, which each use their own per-task `SEED`). |
 
 ### Per-task keys (same structure for all three tasks)
 
@@ -66,7 +102,9 @@ All three scripts read their settings from `config.json` in the working director
 | `MODELS` | List of models to train. Supported values: `"RNN"`, `"RETAIN"`, `"Transformer"`. |
 | `TABLES` | MIMIC-III tables passed to `MIMIC3Dataset`. |
 | `DEV_MODE` | If `true`, PyHealth loads only a small subset of the data (useful for development). Set to `false` for full runs. |
-| `CHECK_POINTS` | List of epoch counts at which to evaluate on the validation set. Each checkpoint re-trains from scratch and the final checkpoint's model is used for test evaluation. |
+| `CHECK_POINTS` | List of epoch counts. For each value, a fresh model is trained from scratch for that many epochs and evaluated on the validation set. The model at the final checkpoint is evaluated on the test set. |
+| `SEED` | Random seed passed to `pyhealth.utils.set_seed` at the start of the run. |
+| `BATCH_SIZE` | Batch size used for all three dataloaders. |
 | `SPLITS` | Patient-level train/val/test fractions. Must sum to 1.0. |
 
 ## Running
@@ -81,15 +119,14 @@ python readmission_prediction_mimic3.py
 
 Each script writes a timestamped log file to `LOG_DIR` (e.g., `drug_recommendation_20260416_120000.log`).
 
-## Common Pipeline
+## Pipeline
 
-All three scripts follow the same pipeline:
+All three scripts follow the same pipeline, implemented in `eecs836_project_helpers.py`:
 
-1. **Initialize** — Load `config.json`, configure logging to a timestamped file in `LOG_DIR`, set random seed to 42 via `pyhealth.utils.set_seed`.
-2. **Load data** — `MIMIC3Dataset` using the tables and paths from the task's config section.
-3. **Set task** — Apply the task-specific sample function to the base dataset.
-4. **Split** — Patient-level train/val/test split using the fractions in `SPLITS`.
-5. **Train and evaluate** — For each model in `MODELS`, iterate over each epoch count in `CHECK_POINTS`, training from scratch each time and logging validation metrics. After the final checkpoint, evaluate on the held-out test set and log the results.
+1. **`setup_logging`** — Create `LOG_DIR`, open a timestamped log file, return a logger.
+2. **`load_task_config`** — Read the task's config block; call `set_seed`.
+3. **`load_and_split_dataset`** — Load `MIMIC3Dataset`, apply the task, split 80/10/10 by patient, return dataloaders.
+4. **`run_training_loop`** — For each model in `MODELS`, iterate over `CHECK_POINTS`: train from scratch for that many epochs, log validation metrics, then evaluate the final checkpoint on the test set.
 
 ## Data Access
 
