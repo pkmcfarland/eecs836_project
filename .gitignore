@@ -4,3 +4,4 @@ Project.code-workspace
 Logs/
 output/
 config.json
+__pycache__/
