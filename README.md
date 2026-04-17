@@ -35,16 +35,34 @@ Contains everything shared across the three task scripts:
 | Symbol | Type | Description |
 |---|---|---|
 | `MODEL_DICT` | dict | Maps model name strings (`"RNN"`, `"RETAIN"`, `"Transformer"`) to their PyHealth classes. |
+| `CheckpointingTrainer` | class | `Trainer` subclass that adds a per-epoch callback mechanism. See below. |
 | `precision_at_k(y_true, y_prob, k)` | function | Sample-averaged Precision@k for multi-label prediction. |
 | `recall_at_k(y_true, y_prob, k)` | function | Sample-averaged Recall@k for multi-label prediction. |
 | `setup_logging(task_name, config)` | function | Creates `LOG_DIR`, configures root logging to a timestamped file, returns a named logger. |
 | `load_task_config(config, task_key, logger)` | function | Extracts the task block from config and returns a flat dict of pipeline parameters. |
 | `load_and_split_dataset(...)` | function | Loads `MIMIC3Dataset`, applies a task, splits by patient, and returns three dataloaders. |
-| `run_training_loop(...)` | function | Trains each model at each checkpoint and evaluates on val and test. Returns `(results, raw_preds)`. |
+| `run_training_loop(...)` | function | Trains each model once to the longest checkpoint, capturing validation metrics at intermediate checkpoints via callback. Returns `(results, raw_preds)`. |
 | `save_results(results, task_name, log_dir, logger)` | function | Serialises the results dict to a timestamped JSON file in `LOG_DIR`. Converts numpy scalars to plain Python types before writing. |
 
+### `CheckpointingTrainer`
+
+PyHealth's `Trainer` has no callback mechanism, so `CheckpointingTrainer` subclasses it and overrides `train()` to add two extra keyword arguments:
+
+| Parameter | Type | Description |
+|---|---|---|
+| `checkpoint_epochs` | `set[int]` | 1-based epoch numbers at which to fire the callback. |
+| `on_checkpoint` | `Callable[[int, dict], None]` | Called as `on_checkpoint(epoch, val_scores)` immediately after validation completes at each checkpoint epoch. `epoch` is the 1-based count; `val_scores` is the dict returned by `self.evaluate(val_dataloader)`. |
+
+All other parameters and behaviour — optimizer setup, gradient clipping, best-model tracking, early stopping, checkpoint saving — are identical to the parent `Trainer`.
+
+### `run_training_loop`
+
+Each model is trained **once** to `max(CHECK_POINTS)` epochs using a `CheckpointingTrainer`. An `on_checkpoint` closure fires at the end of every epoch whose 1-based count appears in `CHECK_POINTS`, storing that epoch's validation scores without restarting training. After the full run completes, the model is evaluated on the test set.
+
+This replaces the previous approach of re-instantiating a fresh model and trainer for each checkpoint value, which was redundant and discarded all learned weights between checkpoints.
+
 `run_training_loop` returns two values:
-- `results` — dict keyed by model name, containing `val_by_epoch` and `test` metric dicts.
+- `results` — dict keyed by model name, containing `val_by_epoch` (one entry per checkpoint epoch) and `test` metric dicts.
 - `raw_preds` — dict keyed by model name, containing `(y_true, y_prob)` arrays from test-set inference. Used by the drug recommendation script to compute Precision@k and Recall@k; ignored by the binary tasks.
 
 ## Configuration (`config.json`)
@@ -103,7 +121,7 @@ All paths and hyperparameters live in `config.json`. The file has shared top-lev
 | `MODELS` | List of models to train. Supported values: `"RNN"`, `"RETAIN"`, `"Transformer"`. |
 | `TABLES` | MIMIC-III tables passed to `MIMIC3Dataset`. |
 | `DEV_MODE` | If `true`, PyHealth loads only a small subset of the data (useful for development). Set to `false` for full runs. |
-| `CHECK_POINTS` | List of epoch counts. For each value, a fresh model is trained from scratch for that many epochs and evaluated on the validation set. The model at the final checkpoint is evaluated on the test set. |
+| `CHECK_POINTS` | List of epoch counts at which to record validation metrics. A single model is trained once to the largest value; validation scores are captured at every listed epoch via callback. The model is then evaluated on the test set. |
 | `SEED` | Random seed passed to `pyhealth.utils.set_seed` at the start of the run. |
 | `BATCH_SIZE` | Batch size used for all three dataloaders. |
 | `SPLITS` | Patient-level train/val/test fractions. Must sum to 1.0. |
@@ -129,7 +147,7 @@ All three scripts follow the same pipeline, implemented in `eecs836_project_help
 1. **`setup_logging`** — Create `LOG_DIR`, open a timestamped log file, return a logger.
 2. **`load_task_config`** — Read the task's config block; call `set_seed`.
 3. **`load_and_split_dataset`** — Load `MIMIC3Dataset`, apply the task, split 80/10/10 by patient, return dataloaders.
-4. **`run_training_loop`** — For each model in `MODELS`, iterate over `CHECK_POINTS`: train from scratch for that many epochs, log validation metrics, then evaluate the final checkpoint on the test set.
+4. **`run_training_loop`** — For each model in `MODELS`, create one `CheckpointingTrainer` and train to `max(CHECK_POINTS)` epochs. Validation metrics are captured at every epoch in `CHECK_POINTS` via the `on_checkpoint` callback; no model is re-instantiated between checkpoints. The final model is then evaluated on the test set.
 5. **`save_results`** — Serialise the completed results dict to a timestamped JSON file in `LOG_DIR`.
 
 ## Data Access

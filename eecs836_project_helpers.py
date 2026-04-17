@@ -2,12 +2,17 @@ import datetime
 import json
 import logging
 from pathlib import Path
+from typing import Any, Callable, Dict, Optional, Set, Type
 
 import numpy as np
+import torch
+from torch.optim import Optimizer
+from torch.utils.data import DataLoader
+from tqdm import trange
 
 from pyhealth.datasets import MIMIC3Dataset, split_by_patient, get_dataloader
 from pyhealth.models import RNN, RETAIN, Transformer
-from pyhealth.trainer import Trainer
+from pyhealth.trainer import Trainer, is_best
 
 ### CONSTANTS ###
 MODEL_DICT = {
@@ -15,6 +20,134 @@ MODEL_DICT = {
     "RETAIN": RETAIN,
     "Transformer": Transformer,
 }
+
+
+### TRAINER SUBCLASS ###
+
+class CheckpointingTrainer(Trainer):
+    """Extends Trainer with a per-epoch callback fired at specified checkpoints.
+
+    Identical to the parent in every respect except that train() accepts two
+    extra keyword arguments:
+
+        checkpoint_epochs : set[int]
+            1-based epoch numbers at which to fire the callback.
+        on_checkpoint : Callable[[int, dict], None]
+            Called as on_checkpoint(epoch, val_scores) immediately after
+            validation completes at each checkpoint epoch. The epoch argument
+            is the 1-based epoch count; val_scores is the dict returned by
+            self.evaluate(val_dataloader).
+    """
+
+    def train(
+        self,
+        train_dataloader: DataLoader,
+        val_dataloader: Optional[DataLoader] = None,
+        test_dataloader: Optional[DataLoader] = None,
+        epochs: int = 5,
+        optimizer_class: Type[Optimizer] = torch.optim.Adam,
+        optimizer_params: Optional[Dict[str, Any]] = None,
+        steps_per_epoch: Optional[int] = None,
+        evaluation_steps: int = 1,
+        weight_decay: float = 0.0,
+        max_grad_norm: Optional[float] = None,
+        monitor: Optional[str] = None,
+        monitor_criterion: str = "max",
+        load_best_model_at_last: bool = True,
+        patience=None,
+        checkpoint_epochs: Optional[Set[int]] = None,
+        on_checkpoint: Optional[Callable[[int, dict], None]] = None,
+    ):
+        if optimizer_params is None:
+            optimizer_params = {"lr": 1e-3}
+
+        # --- identical to Trainer.train() from here --- #
+
+        optimizer_grouped_parameters = [
+            {
+                "params": [
+                    p for n, p in self.model.named_parameters()
+                    if not any(nd in n for nd in ["bias", "LayerNorm.bias", "LayerNorm.weight"])
+                ],
+                "weight_decay": weight_decay,
+            },
+            {
+                "params": [
+                    p for n, p in self.model.named_parameters()
+                    if any(nd in n for nd in ["bias", "LayerNorm.bias", "LayerNorm.weight"])
+                ],
+                "weight_decay": 0.0,
+            },
+        ]
+        optimizer = optimizer_class(optimizer_grouped_parameters, **optimizer_params)
+
+        data_iterator = iter(train_dataloader)
+        best_score = -1 * float("inf") if monitor_criterion == "max" else float("inf")
+        if steps_per_epoch is None:
+            steps_per_epoch = len(train_dataloader)
+        global_step = 0
+        patience_counter = 0
+
+        for epoch in range(epochs):
+            training_loss = []
+            self.model.zero_grad()
+            self.model.train()
+            for _ in trange(
+                steps_per_epoch,
+                desc=f"Epoch {epoch} / {epochs}",
+                smoothing=0.05,
+            ):
+                try:
+                    data = next(data_iterator)
+                except StopIteration:
+                    data_iterator = iter(train_dataloader)
+                    data = next(data_iterator)
+                output = self.model(**data)
+                loss = output["loss"]
+                loss.backward()
+                if max_grad_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), max_grad_norm
+                    )
+                optimizer.step()
+                optimizer.zero_grad()
+                training_loss.append(loss.item())
+                global_step += 1
+
+            if self.exp_path is not None:
+                self.save_ckpt(
+                    __import__("os").path.join(self.exp_path, "last.ckpt")
+                )
+
+            if val_dataloader is not None:
+                scores = self.evaluate(val_dataloader)
+
+                if monitor is not None:
+                    score = scores[monitor]
+                    if is_best(best_score, score, monitor_criterion):
+                        best_score = score
+                        patience_counter = 0
+                        if self.exp_path is not None:
+                            self.save_ckpt(
+                                __import__("os").path.join(self.exp_path, "best.ckpt")
+                            )
+                    else:
+                        patience_counter += 1
+                        if patience is not None and patience_counter >= patience:
+                            break
+
+                # fire the callback at checkpoint epochs (1-based)
+                if on_checkpoint is not None and checkpoint_epochs is not None:
+                    if (epoch + 1) in checkpoint_epochs:
+                        on_checkpoint(epoch + 1, scores)
+
+        if load_best_model_at_last and self.exp_path is not None:
+            best_path = __import__("os").path.join(self.exp_path, "best.ckpt")
+            if __import__("os").path.isfile(best_path):
+                self.load_ckpt(best_path)
+
+        if test_dataloader is not None:
+            self.evaluate(test_dataloader)
 
 
 ### EVALUATION HELPERS ###
@@ -151,12 +284,14 @@ def load_and_split_dataset(data_path, tables, cache_dir, dev_mode,
 def run_training_loop(models, check_points, sample_dataset,
                       train_dl, val_dl, test_dl,
                       metrics, monitor, logger):
-    """Train each model at each checkpoint, then evaluate on the test set.
+    """Train each model once to the longest checkpoint, capturing validation
+    metrics at every intermediate checkpoint via a callback, then evaluate on
+    the test set.
 
-    For each model, each value in check_points is treated as a total epoch
-    count: a fresh model is trained from scratch for that many epochs. This
-    produces one validation snapshot per checkpoint. The model trained to the
-    final checkpoint is then evaluated on the test set.
+    A single CheckpointingTrainer is created per model and trained for
+    max(check_points) epochs. The on_checkpoint callback fires at the end of
+    each epoch whose 1-based count appears in check_points, storing that
+    epoch's validation scores without restarting training.
 
     Args:
         models:         List of model name strings (must be keys in MODEL_DICT).
@@ -179,39 +314,35 @@ def run_training_loop(models, check_points, sample_dataset,
     """
     results = {}
     raw_preds = {}
+    checkpoint_epochs = set(check_points)
 
     for model_name in models:
         results[model_name] = {"val_by_epoch": {}, "test": {}}
         logger.info("Running model: %s", model_name)
 
-        for i, epoch in enumerate(check_points):
-            logger.info("Training %s for %d epochs", model_name, epoch)
+        try:
+            model = MODEL_DICT[model_name](dataset=sample_dataset)
+        except KeyError:
+            logger.error("Model %s not found in MODEL_DICT", model_name)
+            raise
 
-            try:
-                model = MODEL_DICT[model_name](dataset=sample_dataset)
-            except KeyError:
-                logger.error("Model %s not found in MODEL_DICT", model_name)
-                raise
+        def on_checkpoint(epoch, scores, model_name=model_name):
+            results[model_name]["val_by_epoch"][epoch] = scores
+            logger.info("Validation results at epoch %d: %s", epoch, scores)
 
-            trainer = Trainer(model=model, metrics=metrics)
-            trainer.train(
-                train_dataloader=train_dl,
-                val_dataloader=val_dl,
-                epochs=epoch,
-                monitor=monitor,
-            )
-            results[model_name]["val_by_epoch"][epoch] = trainer.evaluate(val_dl)
-            logger.info(
-                "Validation results at epoch %d: %s",
-                epoch, results[model_name]["val_by_epoch"][epoch],
-            )
+        trainer = CheckpointingTrainer(model=model, metrics=metrics)
+        logger.info("Training %s for %d epochs", model_name, max(check_points))
+        trainer.train(
+            train_dataloader=train_dl,
+            val_dataloader=val_dl,
+            epochs=max(check_points),
+            monitor=monitor,
+            checkpoint_epochs=checkpoint_epochs,
+            on_checkpoint=on_checkpoint,
+        )
 
-            # keep only the last trainer/model to save memory
-            if i < len(check_points) - 1:
-                del model, trainer
-
-        y_true, y_prob, _ = trainer.inference(test_dl)  # type: ignore
-        results[model_name]["test"] = trainer.evaluate(test_dl)  # type: ignore
+        y_true, y_prob, _ = trainer.inference(test_dl)
+        results[model_name]["test"] = trainer.evaluate(test_dl)
         raw_preds[model_name] = (y_true, y_prob)
         logger.info("Test results: %s", results[model_name])
 
