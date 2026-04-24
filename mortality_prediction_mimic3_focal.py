@@ -4,7 +4,7 @@ from pyhealth.tasks import MortalityPredictionMIMIC3
 from pyhealth.utils import set_seed
 import torch
 
-from eecs836_project_helpers3 import (
+from eecs836_project_helpers_customCost import (
     setup_logging, load_task_config, load_and_split_dataset, run_training_loop, save_results,
 )
 
