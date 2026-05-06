@@ -1,6 +1,7 @@
 Project.code-workspace
 .claude/settings.local.json
 .cache/
+Old_Logs/
 Logs/
 output/
 config.json
