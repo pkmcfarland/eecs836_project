@@ -6,12 +6,15 @@ from typing import Any, Callable, Dict, Optional, Set, Type
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 from tqdm import trange
 
 from pyhealth.datasets import MIMIC3Dataset, split_by_patient, get_dataloader
 from pyhealth.models import RNN, RETAIN, Transformer
+from pyhealth.tasks import DrugRecommendationMIMIC3, MortalityPredictionMIMIC3
 from pyhealth.trainer import Trainer, is_best
 
 ### CONSTANTS ###
@@ -150,6 +153,94 @@ class CheckpointingTrainer(Trainer):
             self.evaluate(test_dataloader)
 
 
+### FOCAL LOSS ###
+
+class BinaryFocalLoss(nn.Module):
+    """Binary focal loss matching F.binary_cross_entropy_with_logits's call signature.
+
+    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+    where alpha_t = alpha if y == 1 else (1 - alpha), and p_t is the predicted
+    probability of the true class. Operates on raw logits so it can be dropped
+    in wherever F.binary_cross_entropy_with_logits is used.
+    """
+
+    def __init__(self, alpha: float = 0.25, gamma: float = 2.0):
+        super().__init__()
+        self.alpha = float(alpha)
+        self.gamma = float(gamma)
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        target = target.float().view_as(logits)
+        bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+        p = torch.sigmoid(logits)
+        p_t = p * target + (1.0 - p) * (1.0 - target)
+        alpha_t = self.alpha * target + (1.0 - self.alpha) * (1.0 - target)
+        return (alpha_t * (1.0 - p_t).pow(self.gamma) * bce).mean()
+
+
+class MortalityPredictionFocalMIMIC3(MortalityPredictionMIMIC3):
+    """Mortality prediction task variant intended to be trained with focal loss.
+
+    Sample generation is identical to MortalityPredictionMIMIC3 (which processes
+    each patient independently with no cross-patient state, so subclassing
+    introduces no data leakage). The actual loss substitution happens at
+    training time in run_focal_training_loop, since PyHealth selects the loss
+    inside the model based on output_schema rather than in the task.
+    """
+
+    task_name: str = "MortalityPredictionFocalMIMIC3"
+
+
+class MultilabelFocalLoss(nn.Module):
+    """Multilabel focal loss matching F.binary_cross_entropy_with_logits's call
+    signature on (B, L) logits/targets.
+
+    For each (sample, label) cell:
+        FL = -alpha_l_t * (1 - p_t)^gamma * log(p_t)
+    where p_t = sigmoid(logit) if y == 1 else 1 - sigmoid(logit), and alpha_l_t
+    is alpha for positives and (1 - alpha) for negatives. alpha may be a scalar
+    (uniform over labels) or a 1D tensor of length L (per-label positive
+    weight). Final reduction is mean over all (B, L) cells, matching how the
+    PyHealth model's default multilabel BCE reduces.
+    """
+
+    def __init__(self, alpha: "float | torch.Tensor" = 0.25, gamma: float = 2.0):
+        super().__init__()
+        self.gamma = float(gamma)
+        if isinstance(alpha, torch.Tensor):
+            self.alpha_vec: Optional[torch.Tensor] = alpha.float().detach()
+            self.alpha_scalar: Optional[float] = None
+        else:
+            self.alpha_vec = None
+            self.alpha_scalar = float(alpha)
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        target = target.float()
+        bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+        p = torch.sigmoid(logits)
+        p_t = p * target + (1.0 - p) * (1.0 - target)
+        if self.alpha_vec is not None:
+            a = self.alpha_vec.to(logits.device)  # (L,)
+            alpha_t = a * target + (1.0 - a) * (1.0 - target)
+        else:
+            a_s: float = self.alpha_scalar  # type: ignore[assignment]
+            alpha_t = a_s * target + (1.0 - a_s) * (1.0 - target)
+        return (alpha_t * (1.0 - p_t).pow(self.gamma) * bce).mean()
+
+
+class DrugRecommendationFocalMIMIC3(DrugRecommendationMIMIC3):
+    """Drug recommendation task variant intended to be trained with focal loss.
+
+    Sample generation is identical to DrugRecommendationMIMIC3 (per-patient
+    processing, no cross-patient state, so subclassing introduces no data
+    leakage). The actual loss substitution happens at training time in
+    run_multilabel_focal_training_loop, since PyHealth selects the loss inside
+    the model based on output_schema rather than in the task.
+    """
+
+    task_name: str = "DrugRecommendationFocalMIMIC3"
+
+
 ### EVALUATION HELPERS ###
 
 def precision_at_k(y_true, y_prob, k):
@@ -212,7 +303,7 @@ def load_task_config(config, task_key, logger):
 
     Returns:
         Dict with keys: data_path, cache_dir, tables, check_points, dev_mode,
-        splits, models, batch_size, random_seed.
+        patience, splits, models, batch_size, random_seed.
     """
     try:
         task_cfg = config[task_key]
@@ -222,6 +313,7 @@ def load_task_config(config, task_key, logger):
             "tables":      task_cfg["TABLES"],
             "check_points": task_cfg["CHECK_POINTS"],
             "dev_mode":    task_cfg["DEV_MODE"],
+            "patience":    task_cfg["PATIENCE"],
             "splits": [
                 task_cfg["SPLITS"]["TRAIN"],
                 task_cfg["SPLITS"]["VAL"],
@@ -283,7 +375,7 @@ def load_and_split_dataset(data_path, tables, cache_dir, dev_mode,
 
 def run_training_loop(models, check_points, sample_dataset,
                       train_dl, val_dl, test_dl,
-                      metrics, monitor, logger):
+                      metrics, monitor, logger, patience=None):
     """Train each model once to the longest checkpoint, capturing validation
     metrics at every intermediate checkpoint via a callback, then evaluate on
     the test set.
@@ -304,6 +396,7 @@ def run_training_loop(models, check_points, sample_dataset,
         monitor:        Metric name to monitor for best-model selection during
                         training.
         logger:         Logger for progress and result messages.
+        patience:       Early-stopping patience in epochs. None disables it.
 
     Returns:
         results:   Dict keyed by model name, each containing
@@ -331,12 +424,235 @@ def run_training_loop(models, check_points, sample_dataset,
             logger.info("Validation results at epoch %d: %s", epoch, scores)
 
         trainer = CheckpointingTrainer(model=model, metrics=metrics)
-        logger.info("Training %s for %d epochs", model_name, max(check_points))
+        logger.info(
+            "Training %s for %d epochs (patience=%s)",
+            model_name, max(check_points), patience,
+        )
         trainer.train(
             train_dataloader=train_dl,
             val_dataloader=val_dl,
             epochs=max(check_points),
             monitor=monitor,
+            patience=patience,
+            checkpoint_epochs=checkpoint_epochs,
+            on_checkpoint=on_checkpoint,
+        )
+
+        y_true, y_prob, _ = trainer.inference(test_dl)
+        results[model_name]["test"] = trainer.evaluate(test_dl)
+        raw_preds[model_name] = (y_true, y_prob)
+        logger.info("Test results: %s", results[model_name])
+
+    return results, raw_preds
+
+
+def compute_positive_rate(train_dl, label_key, logger):
+    """Compute the positive-class rate from the TRAINING dataloader only.
+
+    Used to derive the focal-loss alpha. Iterating only train_dl (never val/test)
+    is what keeps focal-loss class balancing free of label leakage from the
+    held-out splits.
+    """
+    pos = 0
+    total = 0
+    for batch in train_dl:
+        labels = batch[label_key]
+        if not isinstance(labels, torch.Tensor):
+            labels = torch.as_tensor(labels)
+        flat = labels.float().view(-1)
+        total += int(flat.numel())
+        pos += int(flat.sum().item())
+    rate = (pos / total) if total > 0 else 0.5
+    logger.info(
+        "Train positive rate: %.4f (%d / %d)", rate, pos, total
+    )
+    return rate
+
+
+def run_focal_training_loop(models, check_points, sample_dataset,
+                            train_dl, val_dl, test_dl,
+                            metrics, monitor, label_key, logger,
+                            gamma=2.0, alpha=None, patience=None):
+    """Same as run_training_loop, but trains with BinaryFocalLoss instead of
+    the model's default binary_cross_entropy_with_logits.
+
+    The loss swap is performed by overriding model.get_loss_function on the
+    instance after construction, so the model's existing forward path
+    (`self.get_loss_function()(logits, y_true)`) picks up focal loss without
+    any further changes.
+
+    Args:
+        label_key: Output schema key (e.g. "mortality"). Used to look up labels
+                   in batches when computing the positive-class rate.
+        gamma:     Focusing parameter for focal loss. Default 2.0.
+        alpha:     Positive-class weight in [0, 1]. If None, alpha is set to
+                   (1 - train_positive_rate) so the rare class is up-weighted.
+                   train_positive_rate is computed only from train_dl to avoid
+                   leaking val/test labels into the loss.
+        patience:  Early-stopping patience in epochs. None disables it.
+    """
+    if alpha is None:
+        pos_rate = compute_positive_rate(train_dl, label_key, logger)
+        alpha = 1.0 - pos_rate
+        logger.info(
+            "Focal loss alpha auto-set to %.4f (1 - train positive rate)", alpha
+        )
+    logger.info("Focal loss params: alpha=%.4f, gamma=%.2f", alpha, gamma)
+
+    results = {}
+    raw_preds = {}
+    checkpoint_epochs = set(check_points)
+
+    for model_name in models:
+        results[model_name] = {"val_by_epoch": {}, "test": {}}
+        logger.info("Running model: %s", model_name)
+
+        try:
+            model = MODEL_DICT[model_name](dataset=sample_dataset)
+        except KeyError:
+            logger.error("Model %s not found in MODEL_DICT", model_name)
+            raise
+
+        focal = BinaryFocalLoss(alpha=alpha, gamma=gamma)
+        # Override the loss selector on this model instance only.
+        model.get_loss_function = lambda focal=focal: focal
+
+        def on_checkpoint(epoch, scores, model_name=model_name):
+            results[model_name]["val_by_epoch"][epoch] = scores
+            logger.info("Validation results at epoch %d: %s", epoch, scores)
+
+        trainer = CheckpointingTrainer(model=model, metrics=metrics)
+        logger.info(
+            "Training %s for %d epochs (patience=%s)",
+            model_name, max(check_points), patience,
+        )
+        trainer.train(
+            train_dataloader=train_dl,
+            val_dataloader=val_dl,
+            epochs=max(check_points),
+            monitor=monitor,
+            patience=patience,
+            checkpoint_epochs=checkpoint_epochs,
+            on_checkpoint=on_checkpoint,
+        )
+
+        y_true, y_prob, _ = trainer.inference(test_dl)
+        results[model_name]["test"] = trainer.evaluate(test_dl)
+        raw_preds[model_name] = (y_true, y_prob)
+        logger.info("Test results: %s", results[model_name])
+
+    return results, raw_preds
+
+
+def compute_label_positive_rates(train_dl, label_key, logger):
+    """Per-label positive rates from the TRAINING dataloader only.
+
+    Returns a 1D tensor of length L (label vocabulary size) where entry l is
+    the fraction of train samples in which label l is positive. Used to derive
+    a per-label alpha for MultilabelFocalLoss. Iterating only train_dl (never
+    val/test) is what keeps focal-loss class balancing free of label leakage
+    from the held-out splits. Output is clamped to [eps, 1 - eps] so derived
+    alpha values stay strictly inside (0, 1).
+    """
+    eps = 1e-6
+    pos = None
+    total = 0
+    for batch in train_dl:
+        labels = batch[label_key]
+        if not isinstance(labels, torch.Tensor):
+            labels = torch.as_tensor(labels)
+        labels = labels.float()
+        if labels.dim() == 1:
+            labels = labels.unsqueeze(0)
+        batch_pos = labels.sum(dim=0)  # (L,)
+        pos = batch_pos if pos is None else pos + batch_pos
+        total += int(labels.shape[0])
+
+    if pos is None or total == 0:
+        raise ValueError("compute_label_positive_rates: train dataloader was empty")
+
+    rates = (pos / total).clamp(min=eps, max=1.0 - eps)
+    logger.info(
+        "Train per-label positive rates over %d samples, %d labels: "
+        "mean=%.4f, min=%.4f, max=%.4f",
+        total, rates.numel(),
+        float(rates.mean()), float(rates.min()), float(rates.max()),
+    )
+    return rates
+
+
+def run_multilabel_focal_training_loop(models, check_points, sample_dataset,
+                                        train_dl, val_dl, test_dl,
+                                        metrics, monitor, label_key, logger,
+                                        gamma=2.0, alpha=None, patience=None):
+    """Same as run_training_loop, but trains with MultilabelFocalLoss instead of
+    the model's default per-label binary_cross_entropy_with_logits.
+
+    The loss swap is performed by overriding model.get_loss_function on the
+    instance after construction, so the model's existing forward path
+    (`self.get_loss_function()(logits, y_true)`) picks up focal loss without
+    any further changes.
+
+    Args:
+        label_key: Output schema key (e.g. "drugs"). Used to look up labels in
+                   batches when computing per-label positive rates.
+        gamma:     Focusing parameter for focal loss. Default 2.0.
+        alpha:     Either a float, a 1D torch.Tensor of length L, or None.
+                   If None, alpha is set to (1 - train_positive_rate_per_label),
+                   so rare drugs are up-weighted. The per-label rate is computed
+                   only from train_dl to avoid leaking val/test labels into the
+                   loss.
+        patience:  Early-stopping patience in epochs. None disables it.
+    """
+    if alpha is None:
+        rates = compute_label_positive_rates(train_dl, label_key, logger)
+        alpha = 1.0 - rates  # (L,) per-label positive weight
+        logger.info(
+            "Multilabel focal alpha auto-set per label: mean=%.4f, min=%.4f, max=%.4f",
+            float(alpha.mean()), float(alpha.min()), float(alpha.max()),
+        )
+    elif isinstance(alpha, torch.Tensor):
+        logger.info(
+            "Multilabel focal alpha (provided tensor): mean=%.4f, min=%.4f, max=%.4f",
+            float(alpha.mean()), float(alpha.min()), float(alpha.max()),
+        )
+    else:
+        logger.info("Multilabel focal alpha (scalar): %.4f", float(alpha))
+    logger.info("Multilabel focal gamma=%.2f", gamma)
+
+    results = {}
+    raw_preds = {}
+    checkpoint_epochs = set(check_points)
+
+    for model_name in models:
+        results[model_name] = {"val_by_epoch": {}, "test": {}}
+        logger.info("Running model: %s", model_name)
+
+        try:
+            model = MODEL_DICT[model_name](dataset=sample_dataset)
+        except KeyError:
+            logger.error("Model %s not found in MODEL_DICT", model_name)
+            raise
+
+        focal = MultilabelFocalLoss(alpha=alpha, gamma=gamma)
+        # Override the loss selector on this model instance only.
+        model.get_loss_function = lambda focal=focal: focal
+
+        def on_checkpoint(epoch, scores, model_name=model_name):
+            results[model_name]["val_by_epoch"][epoch] = scores
+            logger.info("Validation results at epoch %d: %s", epoch, scores)
+
+        trainer = CheckpointingTrainer(model=model, metrics=metrics)
+        logger.info(
+            "Training %s for %d epochs (patience=%s)",
+            model_name, max(check_points), patience,
+        )
+        trainer.train(
+            train_dataloader=train_dl,
+            val_dataloader=val_dl,
+            epochs=max(check_points),
+            monitor=monitor,
+            patience=patience,
             checkpoint_epochs=checkpoint_epochs,
             on_checkpoint=on_checkpoint,
         )
