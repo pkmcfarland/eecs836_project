@@ -1,11 +1,12 @@
 import json
 
-from pyhealth.tasks import DrugRecommendationMIMIC3
 from pyhealth.utils import set_seed
 
 from eecs836_project_helpers import (
+    DrugRecommendationFocalMIMIC3,
     setup_logging, load_task_config, load_and_split_dataset,
-    run_training_loop, precision_at_k, recall_at_k, save_results,
+    run_multilabel_focal_training_loop, precision_at_k, recall_at_k,
+    save_results,
 )
 
 if __name__ == "__main__":
@@ -13,11 +14,11 @@ if __name__ == "__main__":
     with open("config.json") as f:
         config = json.load(f)
 
-    logger = setup_logging("drug_recommendation", config)
+    logger = setup_logging("drug_recommendation_focal", config)
     cfg = load_task_config(config, "DRUG_RECOMMENDATION", logger)
     set_seed(cfg["random_seed"])
 
-    task = DrugRecommendationMIMIC3()
+    task = DrugRecommendationFocalMIMIC3()
     sample_dataset, train_dl, val_dl, test_dl = load_and_split_dataset(
         data_path=cfg["data_path"],
         tables=cfg["tables"],
@@ -32,7 +33,7 @@ if __name__ == "__main__":
     drug_vocab_size = len(sample_dataset[0]["drugs"])
     logger.info("Drug vocabulary size (N): %d", drug_vocab_size)
 
-    results, raw_preds = run_training_loop(
+    results, raw_preds = run_multilabel_focal_training_loop(
         models=cfg["models"],
         check_points=cfg["check_points"],
         sample_dataset=sample_dataset,
@@ -41,7 +42,10 @@ if __name__ == "__main__":
         test_dl=test_dl,
         metrics=["pr_auc_samples"],
         monitor="pr_auc_samples",
+        label_key="drugs",
         logger=logger,
+        alpha=0.25,
+        gamma=2.0,
         patience=cfg["patience"],
     )
 
@@ -53,4 +57,4 @@ if __name__ == "__main__":
         results[model_name]["test"]["recall@20"]    = recall_at_k(y_true, y_prob, k=20)
         logger.info("Final test results for %s: %s", model_name, results[model_name]["test"])
 
-    save_results(results, "drug_recommendation", config["LOG_DIR"], logger)
+    save_results(results, "drug_recommendation_focal", config["LOG_DIR"], logger)
